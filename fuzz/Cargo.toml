@@ -1,0 +1,44 @@
+[package]
+name = "rustygit-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.rustygit]
+path = ".."
+
+# cargo-fuzz expects each target listed here.
+
+[[bin]]
+name = "object_parse"
+path = "fuzz_targets/object_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_parse"
+path = "fuzz_targets/config_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tree_parse"
+path = "fuzz_targets/tree_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "commit_parse"
+path = "fuzz_targets/commit_parse.rs"
+test = false
+doc = false
+bench = false

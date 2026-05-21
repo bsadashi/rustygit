@@ -1,0 +1,186 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+# NOTE: this workflow uses no untrusted webhook inputs (no PR titles, bodies,
+# branch names, commit messages etc. flow into `run:` blocks). All commands
+# use fixed args. Future contributors: do not interpolate ${{ github.event.* }}
+# values directly into shell — use env-var indirection per the guide at
+# https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-14    # arm64
+            target: aarch64-apple-darwin
+          - os: macos-13    # x86_64
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: ${{ matrix.target }}
+      - name: Install system git (oracle)
+        run: git --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.target }}
+      - name: Build (release)
+        run: cargo build --release --target ${{ matrix.target }} --verbose
+      - name: Test (debug)
+        run: cargo test --target ${{ matrix.target }} --verbose -- --test-threads=4
+      - name: Test (release)
+        run: cargo test --release --target ${{ matrix.target }} --verbose -- --test-threads=4
+
+  # Windows is "best-effort" per COMPAT.md — the porcelain integration tests
+  # exec shell scripts and assume a POSIX file system, so we don't try to
+  # run them. We DO build the release binary and run library unit tests, so
+  # cross-platform regressions in the lib surface get caught.
+  windows-build:
+    name: windows-build (${{ matrix.target }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+          - target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-${{ matrix.target }}
+      - name: Build (release)
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --target $env:TARGET --verbose --bin rustygit
+      # Library unit tests only — integration tests need POSIX. Skip aarch64
+      # (no Windows-on-ARM runner can execute aarch64 binaries today).
+      - name: Test (lib only, host-runnable targets)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo test --lib --release --target $env:TARGET --verbose
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  msrv:
+    name: msrv (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - name: Check MSRV
+        run: cargo check --workspace --all-targets
+
+  # NON_GOALS C1 — multi-version git compatibility matrix.
+  #
+  # Most CI runners ship a single `git` version. Our `tests/*_compat.rs`
+  # suite uses system `git` as an oracle (byte-equality of objects, refs,
+  # packs, and stdout), so a behavior drift in git's stable line could
+  # silently break our parity claim.
+  #
+  # This job runs the compat suite against pinned `git` versions covering
+  # realistic floor (Debian bookworm LTS = 2.39+), current stable (2.45),
+  # and recent (2.50+). alpine/git ships well-pinned tags and is cheap.
+  #
+  # Triggers: push to main/master + PRs with the `compat-matrix` label.
+  # Don't run on every PR (4-version test would burn free-tier minutes;
+  # main-branch protection + opt-in label is the right tradeoff).
+  #
+  # Security note: matrix.git-version / matrix.image come from this file's
+  # static map. github.event_name is read-only in the `if:` expression.
+  # No untrusted PR-author input is interpolated into `run:` blocks.
+  compat-matrix:
+    name: compat-matrix (git ${{ matrix.git-version }})
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'compat-matrix')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - git-version: "2.39"   # Debian bookworm / Ubuntu 22.04 LTS floor
+            image: alpine/git:v2.39.5
+          - git-version: "2.40"
+            image: alpine/git:v2.40.4
+          - git-version: "2.45"   # mid-stable
+            image: alpine/git:v2.45.4
+          - git-version: "2.50"   # recent
+            image: alpine/git:v2.50.1
+    container:
+      image: ${{ matrix.image }}
+      options: --entrypoint /bin/sh
+    steps:
+      - name: Install build prerequisites (apk)
+        run: apk add --no-cache build-base curl bash perl-utils gnupg gpg-agent openssh-client
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain (rustup)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Print versions (for the log)
+        run: |
+          git --version
+          rustc --version
+          cargo --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: compat-${{ matrix.git-version }}
+      - name: Run compat suite against pinned git
+        # Only the *_compat.rs integration tests use system git as oracle.
+        # Library unit tests already covered by the `test` matrix above.
+        run: cargo test --release --test '*_compat' -- --test-threads=4

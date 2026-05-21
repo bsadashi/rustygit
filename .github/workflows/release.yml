@@ -1,0 +1,539 @@
+name: Release
+
+# Triggers on a tag like v0.1.0 / v1.0.0. Builds release binaries for six
+# targets (Linux x86_64/aarch64 musl, macOS x86_64/aarch64, Windows
+# x86_64/aarch64), produces a universal macOS binary via lipo, packages
+# Linux as .deb and .rpm, generates a Homebrew formula, signs everything
+# with cosign keyless (Fulcio + Rekor), attaches an SBOM, uploads to the
+# GitHub Release, and publishes to crates.io.
+#
+# Manual release: `git tag v0.1.0 && git push origin v0.1.0`.
+#
+# SECURITY POSTURE: the only untrusted-input field this workflow touches is
+# `${{ github.ref_name }}`, which the `on.push.tags` filter constrains to
+# the regex `v[0-9]+.[0-9]+.[0-9]+(-.*)?` — no shell-metacharacters can
+# appear. `${{ github.repository }}` is always a safe `owner/repo` string.
+# Even so, all `run:` blocks that use them go through `env:` with `"$VAR"`
+# quoting per the official guide:
+# https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+            ext: ""
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+            ext: ""
+          - target: x86_64-apple-darwin
+            os: macos-13
+            cross: false
+            ext: ""
+          - target: aarch64-apple-darwin
+            os: macos-14
+            cross: false
+            ext: ""
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+            ext: ".exe"
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+            ext: ".exe"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross (linux only)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --rev v0.2.5
+
+      - name: Build (cross)
+        if: matrix.cross
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cross build --release --target "$TARGET" --bin rustygit
+
+      - name: Build (native — unix)
+        if: ${{ !matrix.cross && runner.os != 'Windows' }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --target "$TARGET" --bin rustygit
+
+      # Windows uses pwsh, not bash. Env-var indirection is still safe.
+      - name: Build (native — windows)
+        if: ${{ !matrix.cross && runner.os == 'Windows' }}
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --target $env:TARGET --bin rustygit
+
+      - name: Stage artifact (unix)
+        if: runner.os != 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+          REF_NAME: ${{ github.ref_name }}
+          EXT: ${{ matrix.ext }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          src="target/${TARGET}/release/rustygit${EXT}"
+          out="dist/rustygit-${REF_NAME}-${TARGET}${EXT}"
+          cp "$src" "$out"
+          (cd dist && shasum -a 256 "rustygit-${REF_NAME}-${TARGET}${EXT}" > "rustygit-${REF_NAME}-${TARGET}${EXT}.sha256")
+
+      - name: Stage artifact (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          REF_NAME: ${{ github.ref_name }}
+          EXT: ${{ matrix.ext }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $src = "target/$env:TARGET/release/rustygit$env:EXT"
+          $out = "dist/rustygit-$env:REF_NAME-$env:TARGET$env:EXT"
+          Copy-Item $src $out
+          $hash = (Get-FileHash -Algorithm SHA256 $out).Hash.ToLower()
+          $name = Split-Path $out -Leaf
+          "$hash  $name" | Out-File -FilePath "$out.sha256" -Encoding ascii -NoNewline
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign artifact (cosign keyless)
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          REF_NAME: ${{ github.ref_name }}
+          EXT: ${{ matrix.ext }}
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --output-signature "dist/rustygit-${REF_NAME}-${TARGET}${EXT}.sig" \
+            --output-certificate "dist/rustygit-${REF_NAME}-${TARGET}${EXT}.pem" \
+            "dist/rustygit-${REF_NAME}-${TARGET}${EXT}"
+
+      - name: SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: dist/rustygit-${{ github.ref_name }}-${{ matrix.target }}.sbom.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustygit-${{ matrix.target }}
+          path: dist/
+          retention-days: 7
+
+  # Combine the two macOS slices into one universal binary (`lipo`).
+  # Runs after both macOS targets land; uploads as a separate artifact.
+  macos-universal:
+    name: macos-universal
+    needs: build
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rustygit-*-apple-darwin
+          path: macslices
+          merge-multiple: true
+
+      - name: lipo combine
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          x86="macslices/rustygit-${REF_NAME}-x86_64-apple-darwin"
+          arm="macslices/rustygit-${REF_NAME}-aarch64-apple-darwin"
+          out="dist/rustygit-${REF_NAME}-universal-apple-darwin"
+          lipo -create "$x86" "$arm" -output "$out"
+          chmod +x "$out"
+          # Sanity: lipo -info should list both arches.
+          lipo -info "$out"
+          (cd dist && shasum -a 256 "rustygit-${REF_NAME}-universal-apple-darwin" > "rustygit-${REF_NAME}-universal-apple-darwin.sha256")
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign universal binary
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --output-signature "dist/rustygit-${REF_NAME}-universal-apple-darwin.sig" \
+            --output-certificate "dist/rustygit-${REF_NAME}-universal-apple-darwin.pem" \
+            "dist/rustygit-${REF_NAME}-universal-apple-darwin"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustygit-universal-apple-darwin
+          path: dist/
+          retention-days: 7
+
+  # Build .deb packages for both Linux arches.
+  deb:
+    name: deb (${{ matrix.target }})
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            deb_arch: amd64
+          - target: aarch64-unknown-linux-musl
+            deb_arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustygit-${{ matrix.target }}
+          path: prebuilt
+
+      - name: Stage prebuilt binary at target/release/rustygit
+        env:
+          TARGET: ${{ matrix.target }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/release
+          cp "prebuilt/rustygit-${REF_NAME}-${TARGET}" target/release/rustygit
+          chmod +x target/release/rustygit
+
+      # NON_GOALS B4: generate shell completions + the man page from the
+      # freshly-built binary, gzip the manpage so cargo-deb can ship it
+      # at `/usr/share/man/man1/rustygit.1.gz` (the `assets` table in
+      # Cargo.toml points at these paths). aarch64 binaries can't run on
+      # an amd64 GH runner, so we fall back to the x86_64 binary that the
+      # parallel build job uploaded.
+      - name: Download x86_64 binary for completion generation (aarch64 only)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: actions/download-artifact@v4
+        with:
+          name: rustygit-x86_64-unknown-linux-musl
+          path: amd64-prebuilt
+      - name: Generate completion + manpage artifacts
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # Pick a runnable binary: on the amd64 runner, `target/release/rustygit`
+          # is amd64 for the x86_64 matrix and we already downloaded the amd64
+          # slice for the aarch64 matrix above.
+          if [ "$MATRIX_TARGET" = "aarch64-unknown-linux-musl" ]; then
+            bin="amd64-prebuilt/rustygit-${REF_NAME}-x86_64-unknown-linux-musl"
+          else
+            bin="target/release/rustygit"
+          fi
+          chmod +x "$bin"
+          mkdir -p target/artifacts/completions target/artifacts/man
+          "$bin" completions bash > target/artifacts/completions/rustygit.bash
+          "$bin" completions zsh  > target/artifacts/completions/_rustygit
+          "$bin" completions fish > target/artifacts/completions/rustygit.fish
+          "$bin" manpage          > target/artifacts/man/rustygit.1
+          gzip -nf9 target/artifacts/man/rustygit.1
+          ls -la target/artifacts/completions/ target/artifacts/man/
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked --version ^2
+
+      - name: cargo deb
+        run: |
+          set -euo pipefail
+          cargo deb --no-build --no-strip --output dist/
+          ls -la dist/
+
+      - name: Rename and hash .deb
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
+        run: |
+          set -euo pipefail
+          src=$(ls dist/*.deb | head -1)
+          out="dist/rustygit-${REF_NAME}-${DEB_ARCH}.deb"
+          mv "$src" "$out"
+          (cd dist && shasum -a 256 "rustygit-${REF_NAME}-${DEB_ARCH}.deb" > "rustygit-${REF_NAME}-${DEB_ARCH}.deb.sha256")
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign .deb
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --output-signature "dist/rustygit-${REF_NAME}-${DEB_ARCH}.deb.sig" \
+            --output-certificate "dist/rustygit-${REF_NAME}-${DEB_ARCH}.deb.pem" \
+            "dist/rustygit-${REF_NAME}-${DEB_ARCH}.deb"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustygit-deb-${{ matrix.deb_arch }}
+          path: dist/
+          retention-days: 7
+
+  # Build .rpm packages for both Linux arches.
+  rpm:
+    name: rpm (${{ matrix.target }})
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            rpm_arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            rpm_arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustygit-${{ matrix.target }}
+          path: prebuilt
+
+      - name: Stage prebuilt binary at target/release/rustygit
+        env:
+          TARGET: ${{ matrix.target }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/release
+          cp "prebuilt/rustygit-${REF_NAME}-${TARGET}" target/release/rustygit
+          chmod +x target/release/rustygit
+
+      # NON_GOALS B4: generate shell completions + the man page. See the
+      # twin step in the `deb` job for the rationale on the aarch64
+      # fallback (can't run the aarch64 musl binary on an amd64 runner).
+      - name: Download x86_64 binary for completion generation (aarch64 only)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: actions/download-artifact@v4
+        with:
+          name: rustygit-x86_64-unknown-linux-musl
+          path: amd64-prebuilt
+      - name: Generate completion + manpage artifacts
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [ "$MATRIX_TARGET" = "aarch64-unknown-linux-musl" ]; then
+            bin="amd64-prebuilt/rustygit-${REF_NAME}-x86_64-unknown-linux-musl"
+          else
+            bin="target/release/rustygit"
+          fi
+          chmod +x "$bin"
+          mkdir -p target/artifacts/completions target/artifacts/man
+          "$bin" completions bash > target/artifacts/completions/rustygit.bash
+          "$bin" completions zsh  > target/artifacts/completions/_rustygit
+          "$bin" completions fish > target/artifacts/completions/rustygit.fish
+          "$bin" manpage          > target/artifacts/man/rustygit.1
+          gzip -nf9 target/artifacts/man/rustygit.1
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm --locked --version ^0.16
+
+      - name: cargo generate-rpm
+        env:
+          RPM_ARCH: ${{ matrix.rpm_arch }}
+        run: |
+          set -euo pipefail
+          cargo generate-rpm --arch "$RPM_ARCH" --output dist/
+
+      - name: Rename and hash .rpm
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          RPM_ARCH: ${{ matrix.rpm_arch }}
+        run: |
+          set -euo pipefail
+          src=$(ls dist/*.rpm | head -1)
+          out="dist/rustygit-${REF_NAME}-${RPM_ARCH}.rpm"
+          mv "$src" "$out"
+          (cd dist && shasum -a 256 "rustygit-${REF_NAME}-${RPM_ARCH}.rpm" > "rustygit-${REF_NAME}-${RPM_ARCH}.rpm.sha256")
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign .rpm
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          RPM_ARCH: ${{ matrix.rpm_arch }}
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --output-signature "dist/rustygit-${REF_NAME}-${RPM_ARCH}.rpm.sig" \
+            --output-certificate "dist/rustygit-${REF_NAME}-${RPM_ARCH}.rpm.pem" \
+            "dist/rustygit-${REF_NAME}-${RPM_ARCH}.rpm"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustygit-rpm-${{ matrix.rpm_arch }}
+          path: dist/
+          retention-days: 7
+
+  # Generate a Homebrew formula referencing the just-built mac binaries.
+  # Emitted as an artifact (and into the GitHub Release) so a separate
+  # homebrew-tap repo (or homebrew-core PR) can pull it.
+  #
+  # NON_GOALS B4 wiring: the `install` block runs `rustygit completions`
+  # and `rustygit manpage` against the freshly-untarred binary to produce
+  # completions + man page on the user's machine at install time. Doing
+  # it that way (instead of bundling pre-generated artifacts inside the
+  # tarball) keeps the GitHub Release artifact list small — one Mach-O
+  # binary per arch — and gives users completions that exactly match the
+  # binary they just installed.
+  homebrew-formula:
+    name: homebrew-formula
+    needs: [build, macos-universal]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rustygit-*-apple-darwin
+          path: macslices
+          merge-multiple: true
+
+      - name: Write Formula/rustygit.rb
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ver="${REF_NAME#v}"
+          base="https://github.com/${REPO}/releases/download/${REF_NAME}"
+
+          sha_arm=$(shasum -a 256 "macslices/rustygit-${REF_NAME}-aarch64-apple-darwin" | awk '{print $1}')
+          sha_x86=$(shasum -a 256 "macslices/rustygit-${REF_NAME}-x86_64-apple-darwin"  | awk '{print $1}')
+
+          mkdir -p dist Formula
+          cat > Formula/rustygit.rb <<EOF
+          # frozen_string_literal: true
+
+          # Homebrew formula for rustygit. Auto-generated at release time by
+          # .github/workflows/release.yml; do not edit by hand.
+          class Rustygit < Formula
+            desc "A from-scratch Rust reimplementation of git's core"
+            homepage "https://github.com/${REPO}"
+            version "${ver}"
+            license any_of: ["Apache-2.0", "MIT"]
+
+            on_macos do
+              on_arm do
+                url "${base}/rustygit-${REF_NAME}-aarch64-apple-darwin"
+                sha256 "${sha_arm}"
+              end
+              on_intel do
+                url "${base}/rustygit-${REF_NAME}-x86_64-apple-darwin"
+                sha256 "${sha_x86}"
+              end
+            end
+
+            def install
+              # The release tarball is a single mach-o binary; pull it in
+              # and chmod +x.
+              bin.install Dir["*"].first => "rustygit"
+
+              # NON_GOALS B4: generate completions + manpage from the
+              # installed binary. Homebrew sets up #{bash_completion},
+              # #{zsh_completion}, #{fish_completion}, and #{man1} as
+              # destination dirs.
+              generate_completions_from_executable(bin/"rustygit", "completions")
+              (man1/"rustygit.1").write Utils.safe_popen_read(bin/"rustygit", "manpage")
+            end
+
+            test do
+              system "#{bin}/rustygit", "--version"
+              # Completions sanity: each shell emits non-empty output.
+              assert_match "complete -F",      shell_output("#{bin}/rustygit completions bash")
+              assert_match "#compdef rustygit", shell_output("#{bin}/rustygit completions zsh")
+              assert_match "complete -c rustygit", shell_output("#{bin}/rustygit completions fish")
+            end
+          end
+          EOF
+          cp Formula/rustygit.rb dist/rustygit.rb
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-formula
+          path: dist/
+          retention-days: 7
+
+  publish:
+    name: publish
+    needs: [build, macos-universal, deb, rpm, homebrew-formula]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify version tag matches Cargo.toml
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cargo_ver=$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')
+          tag_ver="${REF_NAME#v}"
+          if [ "$cargo_ver" != "$tag_ver" ]; then
+            echo "tag $REF_NAME does not match Cargo.toml version $cargo_ver" >&2
+            exit 1
+          fi
+
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --no-verify
