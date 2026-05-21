@@ -1,0 +1,81 @@
+# Compatibility corpus configuration (NON_GOALS C2).
+#
+# This file is the SINGLE source of truth for which public repos we clone
+# and which read-only operations we cross-check between `rustygit` and
+# `git` for byte-identical stdout. Append-only in practice: removing a
+# repo or op weakens our compatibility evidence; adding one strengthens
+# it without breaking existing runs.
+#
+# Repos are cloned with system `git` (we trust the well-tested upstream
+# for the clone step itself); the comparison is done on the cloned state
+# afterwards. Shallow clones keep the corpus footprint bounded so the
+# nightly job stays under GitHub Actions cache limits.
+
+[[repo]]
+name = "git"
+url = "https://github.com/git/git.git"
+shallow = true
+depth = 5000
+
+[[repo]]
+name = "rust"
+url = "https://github.com/rust-lang/rust.git"
+shallow = true
+depth = 2000
+
+[[repo]]
+name = "typescript"
+url = "https://github.com/microsoft/TypeScript.git"
+shallow = true
+depth = 2000
+
+[[repo]]
+name = "kubernetes"
+url = "https://github.com/kubernetes/kubernetes.git"
+shallow = true
+depth = 2000
+
+# Operations are deterministic read-only commands. Each one MUST be a
+# pure function of the repo state (no `--date=human`, no `-p` paging
+# decisions, no random sampling) or byte-equality won't hold across
+# runs. Order doesn't matter — they're independent.
+
+[[op]]
+label = "log-1000"
+argv = ["log", "--oneline", "-n", "1000"]
+
+[[op]]
+label = "rev-list-count"
+argv = ["rev-list", "--count", "HEAD"]
+
+[[op]]
+label = "ls-tree-root"
+argv = ["ls-tree", "HEAD"]
+
+[[op]]
+label = "ls-tree-recursive"
+argv = ["ls-tree", "-r", "HEAD"]
+
+[[op]]
+label = "show-ref"
+argv = ["show-ref"]
+
+[[op]]
+label = "for-each-ref"
+argv = ["for-each-ref"]
+
+[[op]]
+label = "rev-parse-head"
+argv = ["rev-parse", "HEAD"]
+
+[[op]]
+label = "rev-parse-head-tree"
+argv = ["rev-parse", "HEAD^{tree}"]
+
+[[op]]
+label = "cat-file-head-type"
+argv = ["cat-file", "-t", "HEAD"]
+
+[[op]]
+label = "branch-list"
+argv = ["branch", "--list"]

@@ -1,0 +1,20 @@
+[package]
+name = "xtask-compat-corpus"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Compatibility corpus harness for rustygit (NON_GOALS C2)."
+
+# Standalone crate. NOT a member of the main rustygit Cargo workspace —
+# we don't want corpus harness deps polluting the production binary's
+# dependency tree, audit graph, or `cargo deny` ledger. Run via
+# `cargo run` from this directory, or `cargo run --manifest-path
+# xtask-compat-corpus/Cargo.toml` from the repo root.
+
+[[bin]]
+name = "xtask-compat-corpus"
+path = "src/main.rs"
+
+[dependencies]
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }

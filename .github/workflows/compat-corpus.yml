@@ -1,0 +1,94 @@
+name: compat-corpus
+
+# Nightly compatibility-corpus run (NON_GOALS C2).
+#
+# This workflow clones a curated set of public git repos (`git/git`,
+# `rust-lang/rust`, `microsoft/TypeScript`, `kubernetes/kubernetes`)
+# and runs a fixed deterministic op sequence through both `rustygit`
+# and system `git`, asserting byte-equal stdout. Failing diffs upload
+# as artifacts so the next morning's triage is one click away.
+#
+# Triggers:
+#   - 06:00 UTC nightly cron (corpus stays warm in actions/cache).
+#   - workflow_dispatch for manual runs.
+#
+# Security: this workflow takes NO untrusted webhook input. Both
+# triggers (cron + workflow_dispatch) are repo-maintainer-controlled.
+# The corpus URLs live in `xtask-compat-corpus/corpus.toml` (read by
+# us, not from any PR payload). No `${{ github.event.* }}` values are
+# interpolated into `run:` blocks. The only `github.*` refs used are
+# `github.ref` and `github.run_id`, both server-generated.
+# Reference: https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+# A single nightly run at a time per branch is plenty. If a manual
+# dispatch lands while the cron is running, cancel the older one.
+concurrency:
+  group: compat-corpus-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  corpus:
+    name: compat-corpus
+    runs-on: ubuntu-latest
+    # Allow a generous timeout: shallow clones of four large repos plus
+    # ~10 ops each can run a while on a cold cache.
+    timeout-minutes: 60
+    steps:
+      - name: Checkout (with full history of OUR repo)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system git (oracle) — print version
+        run: git --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: compat-corpus
+
+      - name: Build rustygit (release)
+        run: cargo build --release --bin rustygit --verbose
+
+      - name: Build xtask-compat-corpus
+        run: cargo build --release --manifest-path xtask-compat-corpus/Cargo.toml --verbose
+
+      # The slow step. Cache key derives from corpus.toml — if we add a
+      # repo or bump a depth, the cache is invalidated and we re-clone.
+      # Otherwise we reuse the shallow clones from previous nightlies.
+      - name: Cache corpus clones
+        uses: actions/cache@v4
+        with:
+          path: target/corpus
+          key: corpus-${{ runner.os }}-${{ hashFiles('xtask-compat-corpus/corpus.toml') }}
+          # No restore-keys: we want byte-identical clone state, not
+          # "close enough". A partial match would silently break the
+          # byte-equality assertion.
+
+      - name: Run compatibility corpus
+        run: |
+          ./xtask-compat-corpus/target/release/xtask-compat-corpus \
+            xtask-compat-corpus/corpus.toml \
+            target/corpus \
+            target/release/rustygit
+
+      # Upload .diff snippets on failure so the next morning's triage
+      # is one click away.
+      - name: Upload divergence diffs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-corpus-diffs-${{ github.run_id }}
+          path: target/corpus/**/*.diff
+          if-no-files-found: ignore
+          retention-days: 14
