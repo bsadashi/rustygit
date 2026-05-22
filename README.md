@@ -15,11 +15,14 @@ production sign-off.
 ## Install
 
 ```sh
-# from source (today)
+# from source — the only install path today
 cargo install --path .
-
-# crates.io / Homebrew / .deb — see GO-LIVE.md Phase 2 release pipeline
 ```
+
+Prebuilt distribution artefacts (Linux `.deb` / `.rpm`, Homebrew formula,
+crates.io publish) are deferred. See [`GO-LIVE.md`](GO-LIVE.md) Phase 2
+for the current release pipeline (per-target binaries on the GitHub
+Release page).
 
 ## What rustygit covers vs. what it doesn't
 

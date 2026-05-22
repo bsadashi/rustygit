@@ -19,8 +19,8 @@ to build on.
 ## Step 1 — install
 
 See [`README.md`](README.md). The short version is `cargo install
---path .` from a checkout, with packaged binaries (Homebrew, `.deb`,
-`.rpm`) shipping per `GO-LIVE.md` Phase 2.
+--path .` from a checkout. Prebuilt `.deb` / `.rpm` / Homebrew /
+crates.io distribution is deferred (see `GO-LIVE.md` Phase 2).
 
 ## Step 2 — identity
 
