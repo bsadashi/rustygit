@@ -1,0 +1,62 @@
+name: website
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "website/**"
+      - ".github/workflows/website.yml"
+  workflow_dispatch:
+
+# Pages permissions — only the dedicated deploy job needs id-token + pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Cancel an in-flight run if a new one supersedes it on the same ref.
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: website/package-lock.json
+
+      - name: Install
+        run: npm ci || npm install
+
+      - name: Build
+        env:
+          # GitHub Pages serves a project site at /<repo>/; vite.config.js
+          # honours VITE_BASE so the same source builds for any host.
+          VITE_BASE: /rustygit/
+        run: npm run build
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

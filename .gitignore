@@ -2,3 +2,10 @@ target/
 
 # Claude Code session metadata
 .claude/
+
+# macOS Finder metadata
+.DS_Store
+
+# Playwright / browser-MCP scratch output
+.playwright-mcp/
+website-home-built.png

@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1a1816"/>
+      <stop offset="1" stop-color="#22201d"/>
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#3a352e" stroke-width="0.5"/>
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <rect width="1200" height="630" fill="url(#grid)" opacity="0.5"/>
+
+  <!-- brand mark -->
+  <g transform="translate(80,90)">
+    <rect width="84" height="84" rx="16" fill="#1a1816" stroke="#d97757" stroke-width="2"/>
+    <text x="42" y="56" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, monospace"
+          font-weight="700" font-size="44" fill="#d97757">$_</text>
+  </g>
+  <text x="200" y="148" font-family="Geist, -apple-system, sans-serif" font-weight="600" font-size="44" fill="#f5f2e9">rustygit</text>
+  <text x="200" y="184" font-family="JetBrains Mono, ui-monospace, monospace" font-weight="500" font-size="20" fill="#a89c87">v0.1.0 · beta · 941 tests passing</text>
+
+  <!-- headline -->
+  <text x="80" y="320" font-family="Geist, -apple-system, sans-serif" font-weight="600" font-size="72" fill="#f5f2e9">git, reimplemented</text>
+  <text x="80" y="404" font-family="Geist, -apple-system, sans-serif" font-weight="600" font-size="72" fill="#f5f2e9">in <tspan fill="#d97757">Rust</tspan>.</text>
+
+  <!-- sub -->
+  <text x="80" y="476" font-family="Geist, -apple-system, sans-serif" font-weight="400" font-size="28" fill="#c2b8a3">Byte-for-byte format compatible.</text>
+  <text x="80" y="514" font-family="Geist, -apple-system, sans-serif" font-weight="400" font-size="28" fill="#c2b8a3">One static binary. No Perl, no shell, no Tcl.</text>
+
+  <!-- footer -->
+  <text x="80" y="582" font-family="JetBrains Mono, ui-monospace, monospace" font-weight="500" font-size="18" fill="#8c8170">github.com/bsadashi/rustygit</text>
+  <text x="1120" y="582" text-anchor="end" font-family="JetBrains Mono, ui-monospace, monospace" font-weight="500" font-size="18" fill="#8c8170">Apache-2.0 / MIT</text>
+</svg>
